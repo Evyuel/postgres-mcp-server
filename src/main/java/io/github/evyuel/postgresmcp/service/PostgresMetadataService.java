@@ -8,7 +8,10 @@ import io.github.evyuel.postgresmcp.repository.PostgresCatalogRepository;
 import io.github.evyuel.postgresmcp.repository.PostgresCatalogRepository.ConstraintRow;
 import io.github.evyuel.postgresmcp.repository.PostgresCatalogRepository.RelationRef;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.dao.DataAccessException;
 import org.springframework.stereotype.Service;
 
@@ -16,14 +19,18 @@ import org.springframework.stereotype.Service;
 public class PostgresMetadataService {
     private final PostgresCatalogRepository repository;
     private final MetadataProperties properties;
+    private final PostgresTypeService typeService;
 
-    public PostgresMetadataService(PostgresCatalogRepository repository, MetadataProperties properties) {
+    @Autowired
+    public PostgresMetadataService(PostgresCatalogRepository repository, MetadataProperties properties,
+                                   PostgresTypeService typeService) {
         this.repository = repository;
         this.properties = properties;
+        this.typeService = typeService;
     }
 
     public LimitedResult<SchemaInfo> listSchemas() {
-        return safely(() -> limited(repository.listSchemas(properties.getAllowedSchemas(), fetchLimit())));
+        return safely(() -> limited(repository.listSchemas(fetchLimit())));
     }
 
     public LimitedResult<TableInfo> listTables(String schema) {
@@ -42,7 +49,7 @@ public class PostgresMetadataService {
             var checks = constraints.stream().filter(c -> c.type().equals("c"))
                 .map(PostgresMetadataService::toConstraint).toList();
             return new TableDescription(relation.schema(), relation.name(), relation.objectType(), relation.comment(),
-                repository.listColumns(relation.oid()), primaryKey, uniques, checks,
+                enrichedColumns(relation.oid()), primaryKey, uniques, checks,
                 repository.partitioning(relation.oid()));
         });
     }
@@ -70,13 +77,13 @@ public class PostgresMetadataService {
     private DdlResult buildDdl(RelationRef relation) {
         String qualifiedName = quote(relation.schema()) + "." + quote(relation.name());
         List<String> limitations = new ArrayList<>();
+        var columns = enrichedColumns(relation.oid());
         String create;
         if (relation.relkind().equals("v") || relation.relkind().equals("m")) {
             String prefix = relation.relkind().equals("m") ? "CREATE MATERIALIZED VIEW " : "CREATE VIEW ";
             create = prefix + qualifiedName + " AS\n" + repository.viewDefinition(relation.oid()).strip() + ";";
             limitations.add("Ownership, grants, comments, storage parameters and view options are not included.");
         } else {
-            var columns = repository.listColumns(relation.oid());
             var constraints = repository.listConstraints(relation.oid());
             var partitioning = repository.partitioning(relation.oid());
             var definitions = new ArrayList<String>();
@@ -102,7 +109,22 @@ public class PostgresMetadataService {
         }
         var indexDdl = repository.listIndexes(relation.oid(), properties.getMaxObjects()).stream()
             .filter(index -> !index.primary()).map(IndexInfo::indexDefinition).toList();
-        return new DdlResult(relation.schema(), relation.name(), relation.objectType(), create, indexDdl, limitations);
+        var typeDependencies = typeService.dependencies(columns.stream().map(ColumnInfo::typeDetails).toList());
+        return new DdlResult(relation.schema(), relation.name(), relation.objectType(), create, indexDdl,
+            limitations, typeDependencies);
+    }
+
+    private List<ColumnInfo> enrichedColumns(long relationOid) {
+        var rows = repository.listColumnRows(relationOid);
+        var typeOids = new LinkedHashSet<Long>();
+        rows.forEach(row -> typeOids.add(row.typeOid()));
+        Map<Long, TypeDetails> types = typeService.resolveAll(typeOids);
+        return rows.stream().map(row -> {
+            ColumnInfo column = row.column();
+            return new ColumnInfo(column.name(), column.ordinalPosition(), column.dataType(), column.nullable(),
+                column.defaultExpression(), column.identity(), column.generated(), column.comment(),
+                column.collation(), column.primaryKey(), types.get(row.typeOid()));
+        }).toList();
     }
 
     private static String columnDdl(ColumnInfo column) {
@@ -132,9 +154,6 @@ public class PostgresMetadataService {
 
     private void validateSchema(String schema) {
         requireName(schema, "schema");
-        if (!properties.getAllowedSchemas().isEmpty() && !properties.getAllowedSchemas().contains(schema)) {
-            throw new MetadataException("Schema is not in the configured allowlist");
-        }
         boolean exists = safely(() -> repository.schemaExists(schema));
         if (!exists) throw new MetadataException("Schema is not visible or does not exist");
     }
