@@ -1,5 +1,12 @@
 CREATE SCHEMA IF NOT EXISTS app;
 
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+CREATE TYPE app.order_status AS ENUM ('NEW', 'PAID', 'CANCELLED');
+CREATE DOMAIN app.positive_amount AS numeric(12,2) NOT NULL CHECK (VALUE >= 0);
+CREATE TYPE app.address AS (city text, postal_code text);
+CREATE TYPE app.price_range AS RANGE (subtype = numeric);
+
 CREATE TABLE app.customer (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     email varchar(320) NOT NULL,
@@ -41,3 +48,16 @@ CREATE FUNCTION app.lookup_customer(p_email text) RETURNS bigint
 LANGUAGE sql STABLE AS $$ SELECT id FROM app.customer WHERE email = p_email $$;
 CREATE PROCEDURE app.clear_old_events(p_before date)
 LANGUAGE sql AS $$ DELETE FROM app.events WHERE occurred_on < p_before $$;
+
+CREATE TABLE app.typed_sample (
+    id bigint PRIMARY KEY,
+    status app.order_status NOT NULL,
+    amount app.positive_amount,
+    statuses app.order_status[],
+    shipping_address app.address,
+    accepted_prices app.price_range
+);
+
+CREATE STATISTICS app.purchase_dependencies (dependencies, ndistinct, mcv)
+    ON customer_id, status FROM app.purchase;
+ANALYZE app.purchase;

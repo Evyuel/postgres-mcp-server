@@ -1,164 +1,64 @@
-# PostgreSQL MCP Server — контекст обсуждения и проектирование доработок
+# PostgreSQL MCP Server — утверждённая спецификация
 
-> **Статус: DISCUSSION DRAFT, НЕ утверждённое ТЗ.**
->
-> Этот документ передаёт контекст разговора из ChatGPT в Codex. **Не приступай к реализации, рефакторингу или коммитам, пока пользователь явно не попросит.** Сначала изучи актуальный исходный код и обсуди с пользователем открытые критерии и технические компромиссы. Любые предложенные ниже интерфейсы и значения настроек — предмет обсуждения, если не помечены как согласованные.
+> Статус: реализовано в ветке расширения metadata/diagnostics. Этот документ фиксирует согласованные критерии, а не черновик обсуждения.
 
-## 1. Репозиторий и цель
+## Совместимость и стек
 
-- Репозиторий: https://github.com/Evyuel/postgres-mcp-server
-- Язык/стек по предшествующему обсуждению: Java, Spring Boot, Spring AI MCP, Spring JDBC/HikariCP, PostgreSQL. **Проверь реальные версии, классы и структуру в текущем checkout; не считай эти сведения проверенным снимком кода.**
-- Текущая задача: расширить возможности MCP-сервера для исследования PostgreSQL (включая пользовательские типы колонок), диагностики и оптимизации SQL-запросов.
-- Сценарий: AI-агент вызывает MCP tools, получает полезные метаданные, статистику и планы выполнения, затем формирует обоснованные рекомендации по оптимизации.
+- Java 17, Spring Boot 4.1.1, Spring AI 2.0.1 — версии не обновляются.
+- Поддерживается любой PostgreSQL 14.x (`140000 <= server_version_num < 150000`).
+- Интеграционный образ: `postgres:14.22-alpine`.
+- Необязательные возможности определяются через capabilities; отсутствие `pg_stat_statements` не мешает запуску.
 
-## 2. Уже согласованные требования пользователя
+## Безопасность данных
 
-1. **Среда диагностики — тестовый стенд PostgreSQL.** Риски блокировок при `EXPLAIN ANALYZE` не являются главным ограничением; при этом стоит обсудить защиту данных и предсказуемость работы.
-2. **Тяжёлые SQL-запросы могут выполняться до пяти минут (300 секунд).** Нужно спроектировать согласованный timeout для PostgreSQL, JDBC, MCP-клиента/transport, прокси и конкурентных вызовов.
-3. Инструмент EXPLAIN должен поддерживать параметры **`ANALYZE`, `BUFFERS`, `VERBOSE`, `SETTINGS`, `WAL`, `TIMING`, `SUMMARY`**. Требуется определить совместимость комбинаций с конкретными версиями PostgreSQL, дефолты и валидацию.
-4. Пользователь хочет **сразу реализовать весь обсуждавшийся набор новых tools**, а не только `explain_query`.
-5. Нужна информация о **пользовательских типах колонок**, в первую очередь ENUM; обсуждались DOMAIN, ARRAY, COMPOSITE, RANGE, MULTIRANGE.
-6. Пользователь **хочет ДО реализации дополнительно обсудить критерии**. Именно это ближайшая задача Codex, а не немедленное написание кода.
+- MCP не возвращает значения строк таблиц, MCV/histogram contents, SQL из `pg_stat_activity`/`pg_stat_statements`, JDBC parameters, client address, application name или подробности database errors.
+- Разрешены row estimates/counts, actual rows, `null_frac`, `n_distinct`, timings, buffer/WAL counters и прочие агрегаты.
+- Литералы, которые клиент сам передал в SQL, могут повториться в EXPLAIN JSON.
+- Schema allowlist отсутствует. Сервер работает на тестовом стенде с переданными credentials и не создаёт отдельную роль.
+- SELECT может вызвать функцию с побочными эффектами; read-only transaction не является абсолютной песочницей. Этот риск явно документирован.
 
-## 3. Предварительно обсуждённый список tools
+## MCP tools
 
-В предшествующей беседе упоминались существующие tools (проверить по реальному коду):
+Сохраняются семь исходных contracts: `list_schemas`, `list_tables`, `describe_table`, `get_table_ddl`, `list_indexes`, `list_foreign_keys`, `list_functions`.
 
-- `list_schemas`
-- `list_tables`
-- `describe_table`
-- `get_table_ddl`
-- `list_indexes`
-- `list_foreign_keys`
-- `list_functions`
+Добавляются восемь tools: `describe_type`, `explain_query`, `get_table_statistics`, `get_column_statistics`, `get_index_statistics`, `get_extended_statistics`, `get_query_statistics`, `get_active_queries`.
 
-Новые tools — **все входят в целевой объём**, но сигнатуры и контракты ещё обсуждаются:
+Новые tools используют envelope `{status,data,warnings,error,truncated}` со статусами `SUCCESS`, `INVALID_ARGUMENT`, `NON_SELECT_STATEMENT`, `INVALID_EXPLAIN_OPTIONS`, `TIMEOUT`, `CANCELLED`, `CAPACITY_EXCEEDED`, `INSUFFICIENT_PRIVILEGES`, `FEATURE_UNAVAILABLE`, `RESULT_TOO_LARGE`, `DATABASE_ERROR`.
 
-| Tool | Назначение | Предварительный ввод / выход |
-| --- | --- | --- |
-| `describe_type` | Описать пользовательский тип | `schema`, `type` → тип, ENUM labels, DOMAIN constraints, состав и т. п. |
-| `explain_query` | Получить EXPLAIN с настраиваемыми опциями | `sql`, опции, `format`, `timeoutSeconds` → план, метаданные, ошибки |
-| `get_table_statistics` | Характеристики и статистика таблицы | `schema`, `table` → размеры, estimated rows, scans, analyze/vacuum |
-| `get_column_statistics` | Статистика колонок | `schema`, `table`, `column?` → null_frac, n_distinct, MCV, histogram, correlation |
-| `get_query_statistics` | `pg_stat_statements` | Фильтры/сортировка/лимит → calls, exec time, buffers/IO и т. д. |
-| `get_index_statistics` | Статистика использования индексов | `schema`, `table` → idx_scan, idx_tup_read/fetch, размер, состояние |
-| `get_extended_statistics` | Расширенная статистика | `schema`, `table` → dependencies, ndistinct, MCV / expressions |
-| `get_active_queries` | Активные запросы и блокировки | Продолжительность/лимит/фильтры → activity, waits, blocking PIDs |
+## Пользовательские типы
 
-Итого **7 предполагаемых существующих + 8 новых = 15 tools**. Проверить количество по коду, прежде чем фиксировать окончательно.
+- ENUM и DOMAIN получают реконструированный structural DDL с отметкой `STRUCTURAL_COMPLETE`.
+- COMPOSITE, RANGE и MULTIRANGE получают структурированное описание с отметкой `INFORMATIONAL` и без migration-ready DDL.
+- ARRAY рекурсивно раскрывает element type; DOMAIN — base type. Максимальная глубина 4.
+- Максимум 1000 enum labels/attributes.
+- Owner, grants и comments не входят даже в structural DDL; это отмечается в limitations.
+- `describe_table` получает additive `typeDetails`, `get_table_ddl` — топологически упорядоченные `typeDependencies`.
 
-Также предполагаются изменения существующих `describe_table` (поле `typeDetails`) и `get_table_ddl` (информация о зависимостях от пользовательских типов).
+## EXPLAIN
 
-## 4. Пользовательские типы PostgreSQL
+- Только один полностью literalized `SELECT` либо `WITH ... SELECT`; bindings отсутствуют.
+- DML, DDL, utility statements, multi-statement и `SELECT INTO` запрещены.
+- Используются lexical validation, PreparedStatement/extended protocol, preflight EXPLAIN и проверка modifying plan.
+- Выполнение проходит в отдельном Hikari pool (max 2), read-only transaction, `SET LOCAL statement_timeout`, `lock_timeout`, rollback в `finally`.
+- Третий одновременный EXPLAIN получает fail-fast `CAPACITY_EXCEEDED`.
+- При timeout/interrupt вызывается JDBC `Statement.cancel()`.
+- Defaults: `analyze=false`, `buffers=false`, `verbose=true`, `settings=true`, `wal=false`, `timing=false`, `summary=true`, `format=JSON`, `timeoutSeconds=300`.
+- WAL/TIMING разрешены только при `analyze=true`; flags не включаются автоматически.
+- Max SQL 2 MiB UTF-8, plan JSON 16 MiB, полный response 20 MiB. Частичный JSON plan не возвращается.
 
-**Желаемый эффект:** AI должен понимать допустимые значения ENUM и смысл пользовательских типов, а не только получать строковое `dataType`.
+## Статистика
 
-Пример обсуждавшегося контракта:
+- Table: sizes, estimates, scan/tuple/vacuum/analyze counters, reset time, partitions; `includePartitions=true`, max 500.
+- Column: `null_frac`, average width, `n_distinct` с интерпретацией, correlation, target, inherited; без value arrays.
+- Index: usage, tuple counters, size, flags, AM, definition, reset time; нулевой scan не является рекомендацией удалить индекс.
+- Extended: columns/expressions, kinds, dependencies, ndistinct и только boolean наличия MCV.
+- Query: IDs, top-level, calls/plans/timings/rows, block/WAL/JIT metrics; SQL text исключён. Default limit 50, max 500.
+- Active: PID/DB/user/state/durations/waits/backend type/blockers; SQL/client details исключены. `minDurationMs=1000`, `includeIdle=true`, `includeOwn=false`.
+- Списки могут быть частично возвращены с `truncated=true`; EXPLAIN plan — только целиком.
 
-```json
-{
-  "name": "status",
-  "dataType": "app.order_status",
-  "nullable": false,
-  "typeDetails": {
-    "schema": "app",
-    "name": "order_status",
-    "kind": "ENUM",
-    "enumValues": ["NEW", "PROCESSING", "COMPLETED", "CANCELLED"]
-  }
-}
-```
+## Проверка
 
-Технические ориентиры: `pg_type`, `pg_enum`, `pg_namespace`, `pg_attribute`, `pg_constraint`, `format_type(...)`; использовать OID типов и избегать N+1 запросов на колонку. Учитывать вложенные DOMAIN и массивы ENUM, schema-qualified names, quoted identifiers, атрибуты и ограничения. Сохранять обратную совместимость ответа, если это реально возможно в текущем контракте.
-
-**Обсудить:** глубину рекурсивного раскрытия типов, лимит элементов, репрезентацию DOMAIN CHECK/DEFAULT/NOT NULL, COMPOSITE, RANGE/MULTIRANGE, вывод type DDL и зависимостей в `get_table_ddl`.
-
-## 5. EXPLAIN: обсуждённый интерфейс (НЕ зафиксированный контракт)
-
-```java
-explainQuery(
-    String sql,
-    Boolean analyze,
-    Boolean buffers,
-    Boolean verbose,
-    Boolean settings,
-    Boolean wal,
-    Boolean timing,
-    Boolean summary,
-    String format,
-    Integer timeoutSeconds
-)
-```
-
-Предыдущая рекомендация по дефолтам: `analyze=true`, `buffers=true`, `verbose=true`, `settings=true`, `wal=false`, `timing=true`, `summary=true`, `format=JSON`, `timeoutSeconds=300`. **Это предложение ассистента, а не явное утверждение всех дефолтов пользователем.** Обсудить явное `analyze` (опасность реального исполнения), цену `TIMING`, размер выдачи, поддержку `TEXT`/`JSON`, допустимость `WAL` и поведение несовместимых опций. Не менять флаги молча без решения пользователя.
-
-Пример нужного синтаксиса:
-
-```sql
-EXPLAIN (
-    ANALYZE TRUE,
-    BUFFERS TRUE,
-    VERBOSE TRUE,
-    SETTINGS TRUE,
-    WAL FALSE,
-    TIMING TRUE,
-    SUMMARY TRUE,
-    FORMAT JSON
-)
-SELECT ...;
-```
-
-**Особый пункт:** `EXPLAIN ANALYZE` действительно выполняет анализируемый SQL. Нужно обсудить поддержку DML, откат изменений, запрет нескольких команд, порядок контроля функций с побочными эффектами, execution role, allowlist, и следует ли поддерживать только SELECT. Read-only транзакции несовместимы с анализом части DML; rollback не является универсальной защитой от побочных эффектов (например, sequence/external functions).
-
-## 6. Таймауты и нагрузка — предложено ранее, согласовать детали
-
-- Верхний предел выполнения SQL: **300 секунд — согласовано**.
-- Возможная схема: `SET LOCAL statement_timeout` внутри транзакции; `lock_timeout`, JDBC timeout, внешний timeout MCP/HTTP/прокси, правильное закрытие/откат при ошибке или отмене.
-- Разделить timeout метаданных и тяжёлой диагностики, не увеличивать глобально metadata timeout до 300 секунд.
-- По прежним предложениям: `maxConcurrentAnalysis=2`, `maxSqlLength=65536`, `maxPlanBytes=5MiB`, metadata/statistics timeout ~15 секунд, отдельный `lock_timeout` ~10 секунд. **Всё, кроме предела 300 секунд, требует согласования.**
-- Обсудить очередность при исчерпании concurrency (немедленный отказ или ожидание), отмену при исчезновении MCP-клиента, поведение пула Hikari, потоков Java, PostgreSQL sessions, `SET LOCAL` и внешних таймаутов.
-- Тесты таймаута с малым значением (например, `pg_sleep(3)` при лимите 1 с), не 5-минутные тесты.
-
-## 7. Данные и статистика
-
-- `get_table_statistics`: `pg_class`, `pg_stat_user_tables`, `pg_statio_user_tables`, размеры; аккуратно обрабатывать partitioned tables и секции.
-- `get_column_statistics`: `pg_stats`, `null_frac`, `n_distinct`, `most_common_vals`, `most_common_freqs`, `histogram_bounds`, `correlation`; отрицательное `n_distinct` — оценочная доля строк.
-- `get_index_statistics`: `pg_stat_user_indexes`, `pg_index`, `pg_class`, `pg_get_indexdef`; не рекомендовать удалять индекс только по нулевому `idx_scan`.
-- `get_extended_statistics`: `pg_stats_ext`, `pg_stats_ext_exprs` с учётом версии PostgreSQL.
-- `get_query_statistics`: `pg_stat_statements`, выявлять отсутствие расширения и необходимые права, учитывать статистику по `dbid/userid/queryid/toplevel` и различие версий схемы представления.
-- `get_active_queries`: `pg_stat_activity`, `pg_blocking_pids`, wait events, `query_start` vs `xact_start`, опционально idle in transaction, исключение собственного запроса.
-- `pg_stats` и SQL из `pg_stat_statements` могут раскрывать реальные данные: определить, какие поля и в каком объёме можно передавать AI.
-
-## 8. Предварительные архитектурные ориентиры
-
-- Не превращать metadata-сервис в монолит диагностики: отдельные tools/service/repository/policy/DTO для diagnostics.
-- Нужна централизованная политика исполнения (`QueryExecutionPolicy` или эквивалент).
-- Результаты MCP — структурированные, с явными статусами: timeout, insufficient privileges, feature unavailable, invalid SQL, capacity exceeded.
-- Ограничивать размер выходных данных, при необходимости отдавать краткую сводку + план (решение нужно согласовать).
-- Изолировать SQL пользовательского запроса от конструируемых опций EXPLAIN; использовать parameter binding там, где возможно, и строго валидировать идентификаторы и опции.
-- Учитывать особенности SQL-валидатора PostgreSQL: проверка `startsWith("select")` недостаточна.
-- Для долгих операций продумать MCP progress/cancellation (проверить, поддерживает ли их текущий transport/SDK и клиент).
-
-## 9. Критерии, которые надо дообсудить СЕЙЧАС (до реализации)
-
-Codex должен обсудить с пользователем, приоритетно и предметно:
-
-1. **Поддерживаемые версии PostgreSQL**: одна версия тестового стенда или диапазон, особенности EXPLAIN и статистических системных views.
-2. **Граница безопасности**: SELECT-only vs DML, execution read-only vs отдельная роль, произвольные функции, мультистейтментность.
-3. **EXPLAIN UX**: дефолты опций; FORMAT JSON/TEXT; опциональный `ANALYZE`; compatibility validation и поведение на ошибках; параметры SQL (`$1`) и способы передачи bindings.
-4. **Таймауты и отмена**: 300 секунд только PostgreSQL statement или end-to-end; внешний MCP-клиент и прокси, отмена при disconnect; concurrency и очередь.
-5. **Форма ответа и стоимость контекста AI**: полный plan JSON, короткая сводка, truncation, пагинация/сохранение больших результатов; максимальная длина текста запросов и MCV.
-6. **Права и изоляция**: одна роль/пул или отдельные metadata/diagnostics connections; доступ к `pg_stat_statements`, `pg_read_all_stats`.
-7. **Детализация типов**: какие kind обязательны в первой версии, глубина рекурсии и DDL зависимых типов.
-8. **Модель статистики**: секционированные таблицы, схемы, сортировки, лимиты, неполная статистика, расширения.
-9. **Error contract**: SQLSTATE, partial results, timeout, unavailable feature; диагностика по сообщениям AI.
-10. **Тестирование**: Testcontainers, миграции, fixtures, интеграционные тесты и совместимость MCP tools.
-
-Попроси пользователя выбрать решения там, где действительно есть варианты; не засыпай сразу всеми вопросами. Рекомендуется начать с 3–4 критичных архитектурных развилок, предложив разумные defaults, затем продолжить. Подготовить утверждаемый дизайн/план и **только после явной команды пользователя реализовать его**.
-
-## 10. Инструкция Codex на первом ответе
-
-1. Открой и фактически проанализируй текущий репозиторий и документацию; сообщи, что подтверждено кодом, а что было лишь из предыдущего разговора.
-2. Сверь перечень tools и существующие классы, ограничения и тесты.
-3. Кратко зафиксируй согласованные пункты и перечисли основные нерешённые критерии, с рекомендацией и обоснованием.
-4. **Продолжай обсуждение, не изменяя файлы**. После согласования предложи финальное ТЗ и этапы внутри одного объёма реализации.
+- Unit tests проверяют SQL lexical policy и metadata validation.
+- Testcontainers PostgreSQL 14.22 проверяет типы, partitions, statistics, `pg_stat_statements`, EXPLAIN defaults/rejections/timeout и отсутствие business values.
+- Все 15 tools перечисляются и вызываются через настоящий Streamable HTTP MCP client.
+- Отсутствие Docker не должно молча пропускать интеграционные тесты.

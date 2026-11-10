@@ -8,7 +8,6 @@ import java.sql.SQLException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
-import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Repository;
 
@@ -27,16 +26,16 @@ public class PostgresCatalogRepository {
         this.jdbc = jdbc;
     }
 
-    public List<SchemaInfo> listSchemas(List<String> allowlist, int limit) {
+    public List<SchemaInfo> listSchemas(int limit) {
         var sql = """
             SELECT n.nspname, pg_get_userbyid(n.nspowner) AS owner,
                    obj_description(n.oid, 'pg_namespace') AS comment
             FROM pg_catalog.pg_namespace n
-            WHERE %s AND has_schema_privilege(n.oid, 'USAGE') %s
+            WHERE %s AND has_schema_privilege(n.oid, 'USAGE')
             ORDER BY n.nspname
             LIMIT :limit
-            """.formatted(USER_SCHEMA_PREDICATE, allowlistClause("n.nspname", allowlist));
-        return jdbc.query(sql, parameters(allowlist, limit), (rs, row) ->
+            """.formatted(USER_SCHEMA_PREDICATE);
+        return jdbc.query(sql, Map.of("limit", limit), (rs, row) ->
             new SchemaInfo(rs.getString("nspname"), rs.getString("owner"), rs.getString("comment"), false));
     }
 
@@ -83,8 +82,12 @@ public class PostgresCatalogRepository {
     }
 
     public List<ColumnInfo> listColumns(long relationOid) {
+        return listColumnRows(relationOid).stream().map(ColumnRow::column).toList();
+    }
+
+    public List<ColumnRow> listColumnRows(long relationOid) {
         return jdbc.query("""
-            SELECT a.attname, a.attnum, pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+            SELECT a.attname, a.attnum, a.atttypid, pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
                    NOT a.attnotnull AS nullable, pg_get_expr(d.adbin, d.adrelid) AS default_expression,
                    a.attidentity, a.attgenerated, col_description(a.attrelid, a.attnum) AS comment,
                    CASE WHEN a.attcollation <> t.typcollation THEN coll.collname END AS collation,
@@ -97,11 +100,12 @@ public class PostgresCatalogRepository {
             LEFT JOIN pg_catalog.pg_collation coll ON coll.oid = a.attcollation
             WHERE a.attrelid = :oid AND a.attnum > 0 AND NOT a.attisdropped
             ORDER BY a.attnum
-            """, Map.of("oid", relationOid), (rs, row) -> new ColumnInfo(
+            """, Map.of("oid", relationOid), (rs, row) -> new ColumnRow(new ColumnInfo(
                 rs.getString("attname"), rs.getInt("attnum"), rs.getString("data_type"),
                 rs.getBoolean("nullable"), rs.getString("default_expression"),
                 identity(rs.getString("attidentity")), generated(rs.getString("attgenerated")),
-                rs.getString("comment"), rs.getString("collation"), rs.getBoolean("primary_key")));
+                rs.getString("comment"), rs.getString("collation"), rs.getBoolean("primary_key")),
+                rs.getLong("atttypid")));
     }
 
     public List<ConstraintRow> listConstraints(long relationOid) {
@@ -226,14 +230,6 @@ public class PostgresCatalogRepository {
                 volatility(rs.getString("provolatile")), rs.getBoolean("prosecdef"), rs.getString("comment")));
     }
 
-    private static MapSqlParameterSource parameters(List<String> allowlist, int limit) {
-        return new MapSqlParameterSource().addValue("allowlist", allowlist).addValue("limit", limit);
-    }
-
-    private static String allowlistClause(String column, List<String> allowlist) {
-        return allowlist.isEmpty() ? "" : "AND " + column + " IN (:allowlist)";
-    }
-
     private static List<String> stringList(ResultSet rs, String column) throws SQLException {
         Array array = rs.getArray(column);
         return array == null ? List.of() : Arrays.asList((String[]) array.getArray());
@@ -271,5 +267,6 @@ public class PostgresCatalogRepository {
     public record RelationRef(long oid, String schema, String name, String objectType, String relkind,
                               boolean partition, String comment) {}
     public record ConstraintRow(String name, String type, List<String> columns, String definition) {}
+    public record ColumnRow(ColumnInfo column, long typeOid) {}
 }
 

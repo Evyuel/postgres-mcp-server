@@ -3,7 +3,6 @@ package io.github.evyuel.postgresmcp;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.when;
 
-import io.github.evyuel.postgresmcp.dto.MetadataModels.ColumnInfo;
 import io.github.evyuel.postgresmcp.repository.PostgresCatalogRepository;
 import io.github.evyuel.postgresmcp.repository.PostgresCatalogRepository.RelationRef;
 import io.modelcontextprotocol.client.McpClient;
@@ -19,7 +18,6 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
-    "app.metadata.allowed-schemas=app",
     "spring.datasource.url=jdbc:postgresql://127.0.0.1:1/not-used"
 })
 class McpTransportIntegrationTest {
@@ -31,8 +29,7 @@ class McpTransportIntegrationTest {
         when(repository.schemaExists("app")).thenReturn(true);
         when(repository.findRelation("app", "customer"))
             .thenReturn(new RelationRef(42L, "app", "customer", "TABLE", "r", false, "Customers"));
-        when(repository.listColumns(42L)).thenReturn(List.of(
-            new ColumnInfo("id", 1, "bigint", false, null, "ALWAYS", null, null, null, true)));
+        when(repository.listColumnRows(42L)).thenReturn(List.of());
         when(repository.listConstraints(42L)).thenReturn(List.of());
         when(repository.partitioning(42L)).thenReturn(null);
     }
@@ -45,7 +42,10 @@ class McpTransportIntegrationTest {
             client.initialize();
             assertThat(client.listTools().tools()).extracting(McpSchema.Tool::name).containsExactlyInAnyOrder(
                 "list_schemas", "list_tables", "describe_table", "get_table_ddl",
-                "list_indexes", "list_foreign_keys", "list_functions");
+                "list_indexes", "list_foreign_keys", "list_functions", "describe_type",
+                "explain_query", "get_table_statistics", "get_column_statistics",
+                "get_index_statistics", "get_extended_statistics", "get_query_statistics",
+                "get_active_queries");
 
             var result = client.callTool(McpSchema.CallToolRequest.builder("describe_table")
                 .arguments(Map.of("schema", "app", "table", "customer")).build());
